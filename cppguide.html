@@ -21,8 +21,8 @@ this power brings with it complexity, which in turn can make
 code more bug-prone and harder to read and maintain.</p>
 
 <p>The goal of this guide is to manage this complexity by
-describing in detail the dos and don'ts of writing C++ code
-. These rules exist to
+describing in detail the dos and don'ts of writing C++
+code. These rules exist to
 keep  the code base manageable while still allowing
 coders to use C++ language features productively.</p>
 
@@ -164,9 +164,8 @@ input.</p>
 
 <h2 id="C++_Version">C++ Version</h2>
 
-<p>Currently, code should target C++17, i.e., should not use C++2x
-  features, with the exception of <a href="#Designated_initializers">designated
-  initializers</a>. The C++ version targeted by this guide will advance
+<p>Currently, code should target C++20, i.e., should not use C++23
+  features. The C++ version targeted by this guide will advance
   (aggressively) over time.</p>
 
 
@@ -176,7 +175,7 @@ input.</p>
 
 <div>
 <p>Consider portability to other environments before using features
-from C++14 and C++17 in your project.</p>
+from C++17 and C++20 in your project.</p>
 </div>
 
 <h2 id="Header_Files">Header Files</h2>
@@ -686,6 +685,11 @@ inline void my_inline_function() {
 using ::absl::container_internal::ImplementationDetail;
 </pre>
   </li>
+
+  <li><p>Single-line nested namespace declarations
+
+    are preferred in new code, but are not required.</p>
+  </li>
 </ul>
 
 <a id="Unnamed_Namespaces_and_Static_Variables"></a>
@@ -940,14 +944,10 @@ Foo a[] = { Foo(1), Foo(2), Foo(3) };  // Fine</pre>
 
 <p>Constant initialization is always allowed. Constant initialization of
 static storage duration variables should be marked with <code>constexpr</code>
-or where possible the
-
-
-<a href="https://github.com/abseil/abseil-cpp/blob/03c1513538584f4a04d666be5eb469e3979febba/absl/base/attributes.h#L540">
-<code>ABSL_CONST_INIT</code></a>
-attribute. Any non-local static storage
+or <code>constinit</code></p>.
+Any non-local static storage
 duration variable that is not so marked should be presumed to have
-dynamic initialization, and reviewed very carefully.</p>
+dynamic initialization, and reviewed very carefully.
 
 <p>By contrast, the following initializations are problematic:</p>
 
@@ -1044,9 +1044,12 @@ thread, rather than once at program startup. This means that
 other <code>thread_local</code> variables are subject to the same
 initialization-order issues as static variables (and more besides).</p>
 
-<p><code>thread_local</code> variable instances are not destroyed before their
-thread terminates, so they do not have the destruction-order issues of static
-variables.</p>
+<p><code>thread_local</code> variables have a subtle destruction-order issue:
+during thread shutdown, <code>thread_local</code> variables will be destroyed
+in the opposite order of their initialization (as is generally true in C++).
+If code triggered by the destructor of any <code>thread_local</code> variable
+refers to any already-destroyed <code>thread_local</code> on that thread, we will
+get a particularly hard to diagnose use-after-free.</p>
 
 <p class="pros"></p>
 <ul>
@@ -1060,22 +1063,47 @@ variables.</p>
 <p class="cons"></p>
 <ul>
   <li>Accessing a <code>thread_local</code> variable may trigger execution of
-    an unpredictable and uncontrollable amount of other code.</li>
+    an unpredictable and uncontrollable amount of other code during thread-start or
+    first use on a given thread.</li>
   <li><code>thread_local</code> variables are effectively global variables,
     and have all the drawbacks of global variables other than lack of
     thread-safety.</li>
   <li>The memory consumed by a <code>thread_local</code> variable scales with
     the number of running threads (in the worst case), which can be quite large
     in a  program.</li>
-  <li>Non-static data members cannot be <code>thread_local</code>.</li>
-  <li><code>thread_local</code> may not be as efficient as certain compiler
-    intrinsics.</li>
+  <li>Data members cannot be <code>thread_local</code> unless they are also
+    <code>static</code>.</li>
+  <li>We may suffer from use-after-free bugs if <code>thread_local</code> variables
+    have complex destructors. In particular, the destructor of any such variable must not
+    call any code (transitively) that refers to any potentially-destroyed
+    <code>thread_local</code>. This property is hard to enforce.</li>
+
+  <li>Approaches for avoiding use-after-free in global/static contexts do not work for
+    <code>thread_local</code>s. Specifically, skipping destructors for globals and static
+    variables is allowable because their lifetimes end at program shutdown. Thus, any "leak"
+    is managed immediately by the OS cleaning up our memory and other resources. By
+    contrast, skipping destructors for <code>thread_local</code> variables leads to resource
+    leaks proportional to the total number of threads that terminate during the lifetime of
+    the program.</li>
 
 </ul>
 
 <p class="decision"></p>
-  <p><code>thread_local</code> variables inside a function have no safety
-    concerns, so they can be used without restriction. Note that you can use
+  <p><code>thread_local</code> variables at class or namespace scope must be
+  initialized with a true compile-time constant (i.e., they must have no
+  dynamic initialization). To enforce this, <code>thread_local</code> variables
+  at class or namespace scope must be annotated with
+
+
+  <a href="https://github.com/abseil/abseil-cpp/blob/master/absl/base/attributes.h">
+  <code>ABSL_CONST_INIT</code></a>
+  (or <code>constexpr</code>, but that should be rare):</p>
+
+  <pre>  ABSL_CONST_INIT thread_local Foo foo = ...;
+  </pre>
+
+  <p><code>thread_local</code> variables inside a function have no initialization
+    concerns, but still risk use-after-free during thread exit. Note that you can use
     a function-scope <code>thread_local</code> to simulate a class- or
     namespace-scope <code>thread_local</code> by defining a function or
     static method that exposes it:</p>
@@ -1086,18 +1114,12 @@ variables.</p>
 }
 </pre>
 
-<p><code>thread_local</code> variables at class or namespace scope must be
-initialized with a true compile-time constant (i.e., they must have no
-dynamic initialization). To enforce this, <code>thread_local</code> variables
-at class or namespace scope must be annotated with
-
-
-<a href="https://github.com/abseil/abseil-cpp/blob/master/absl/base/attributes.h">
-<code>ABSL_CONST_INIT</code></a>
-(or <code>constexpr</code>, but that should be rare):</p>
-
-<pre>ABSL_CONST_INIT thread_local Foo foo = ...;
-</pre>
+  <p>Note that <code>thread_local</code> variables will be destroyed whenever a thread exits.
+    If the destructor of any such variable refers to any other (potentially-destroyed)
+    <code>thread_local</code> we will suffer from hard to diagnose use-after-free bugs.
+    Prefer trivial types, or types that provably run no user-provided code at destruction to
+    minimize the potential of accessing any other <code>thread_local</code>.
+  </p>
 
 <p><code>thread_local</code> should be preferred over other mechanisms for
 defining thread-local data.</p>
@@ -1444,9 +1466,9 @@ break those invariants. Constructors, destructors, and helper methods may
 be present; however, these methods must not require or enforce any
 invariants.</p>
 
-<p>If more functionality or invariants are required, a
-<code>class</code> is more appropriate. If in doubt, make
-it a <code>class</code>.</p>
+<p>If more functionality or invariants are required, or struct has wide visibility and expected to
+evolve, then a <code>class</code> is more appropriate. If in doubt, make it a <code>class</code>.
+</p>
 
 <p>For consistency with STL, you can use
 <code>struct</code> instead of <code>class</code> for
@@ -1656,17 +1678,23 @@ definitions. If possible, avoid defining operators as templates,
 because they must satisfy this rule for any possible template
 arguments. If you define an operator, also define
 any related operators that make sense, and make sure they
-are defined consistently. For example, if you overload
-<code>&lt;</code>, overload all the comparison operators,
-and make sure <code>&lt;</code> and <code>&gt;</code> never
-return true for the same arguments.</p>
+are defined consistently.</p>
 
 <p>Prefer to define non-modifying binary operators as
 non-member functions. If a binary operator is defined as a
 class member, implicit conversions will apply to the
 right-hand argument, but not the left-hand one. It will
-confuse your users if <code>a &lt; b</code> compiles but
-<code>b &lt; a</code> doesn't.</p>
+confuse your users if <code>a + b</code> compiles but
+<code>b + a</code> doesn't.</p>
+
+<p>For a type <code>T</code> whose values can be compared for
+equality, define a non-member <code>operator==</code> and document when
+two values of type <code>T</code> are considered equal.
+If there is a single obvious notion of when a value <code>t1</code>
+of type <code>T</code> is less than another such value <code>t2</code> then
+you may also define <code>operator&lt;=&gt;</code>, which should be
+consistent with <code>operator==</code>.
+Prefer not to overload the other comparison and ordering operators.</p>
 
 <p>Don't go out of your way to avoid defining operator
 overloads. For example, prefer to define <code>==</code>,
@@ -2613,8 +2641,8 @@ casts when explicit type conversion is necessary.
   types,
   including <code>void*</code>. Use this
   only if you know what you are doing and you understand the aliasing
-  issues. Also, consider the alternative
-  <code>absl::bit_cast</code>.</li>
+  issues. Also, consider dereferencing the pointer (without a cast) and
+  using <code>absl::bit_cast</code> to cast the resulting value.</li>
 
   <li>Use <code>absl::bit_cast</code> to interpret the raw bits of a
   value using a different type of the same size (a type pun), such as
@@ -2852,10 +2880,13 @@ putting the "adjective" (<code>const</code>) before the
 <code>const</code> first, we do not require it. But be
 consistent with the code around you!</p>
 
-<h3 id="Use_of_constexpr">Use of constexpr</h3>
+<h3 id="Use_of_constexpr">Use of constexpr, constinit, and consteval</h3>
 
 <p>Use <code>constexpr</code> to define true
-constants or to ensure constant initialization.</p>
+constants or to ensure constant initialization.
+Use <code>constinit</code> to ensure constant
+initialization for non-constant variables.
+</p>
 
 <p class="definition"></p>
 <p> Some variables can be declared <code>constexpr</code>
@@ -2863,7 +2894,8 @@ to indicate the variables are true constants, i.e., fixed at
 compilation/link time. Some functions and constructors
 can be declared <code>constexpr</code> which enables them
 to be used in defining a <code>constexpr</code>
-variable.</p>
+variable. Functions can be declared <code>consteval</code>
+to restrict their use to compile time.</p>
 
 <p class="pros"></p>
 <p>Use of <code>constexpr</code> enables definition of
@@ -2884,9 +2916,11 @@ in these definitions.</p>
 robust specification of the constant parts of an
 interface. Use <code>constexpr</code> to specify true
 constants and the functions that support their
-definitions. Avoid complexifying function definitions to
+definitions. <code>consteval</code> may be used for
+code that must not be invoked at runtime.
+Avoid complexifying function definitions to
 enable their use with <code>constexpr</code>. Do not use
-<code>constexpr</code> to force inlining.</p>
+<code>constexpr</code> or <code>consteval</code> to force inlining.</p>
 
 <h3 id="Integer_Types">Integer Types</h3>
 
@@ -2926,7 +2960,9 @@ like <code>int16_t</code>, <code>uint32_t</code>,
 <code>int64_t</code>, etc. You should always use
 those in preference to <code>short</code>, <code>unsigned
 long long</code> and the like, when you need a guarantee
-on the size of an integer. Of the built-in integer types, only
+on the size of an integer. Prefer to omit the <code>std::</code>
+prefix for these types, as the extra 5 characters do
+not merit the added clutter. Of the built-in integer types, only
 <code>int</code> should be used. When appropriate, you
 are welcome to use standard type aliases like
 <code>size_t</code> and <code>ptrdiff_t</code>.</p>
@@ -3125,7 +3161,6 @@ possible:</p>
 
   <li>Prefer not using <code>##</code> to generate
   function/class/variable names.</li>
-
 
 </ul>
 
@@ -3503,8 +3538,8 @@ ordering of fields than the <code>Point</code> example above.</p>
 
 <p class="cons"></p>
 <p>While designated initializers have long been part of the C standard and
-supported by C++ compilers as an extension, only recently have they made it
-into the C++ standard, being added as part of C++20.</p>
+supported by C++ compilers as an extension, they were not supported by
+C++ prior to C++20.</p>
 
 <p>The rules in the C++ standard are stricter than in C and compiler extensions,
 requiring that the designated initializers appear in the same order as the
@@ -3746,6 +3781,113 @@ error messages are part of your user interface, and your code should
 be tweaked as necessary so that the error messages are understandable
 and actionable from a user point of view.</p>
 
+<h3 id="Concepts">Concepts and Constraints</h3>
+
+<p>Use concepts sparingly.
+In general, concepts and constraints should only be used in cases
+where templates would have been used prior to C++20.
+Avoid introducing new concepts in headers,
+unless the headers are marked as internal to the library.
+Do not define concepts that are not enforced by the compiler.
+Prefer constraints over template metaprogramming, and
+avoid the <code>template&lt;<i>Concept</i> T&gt;</code> syntax;
+instead, use the <code>requires(<i>Concept&lt;T&gt;</i>)</code>
+syntax.</p>
+
+<p class="definition"></p>
+<p>The <code>concept</code> keyword is a new mechanism for defining
+requirements (such as type traits or interface specifications)
+for a template parameter.
+The <code>requires</code> keyword provides mechanisms for placing
+anonymous constraints on templates and verifying that constraints
+are satisfied at compile time.
+Concepts and constraints are often used together, but can be
+also used independently.</p>
+
+<p class="pros"></p>
+<ul>
+  <li>Concepts allow the compiler to generate much better error
+  messages when templates are involved, which can reduce confusion
+  and significantly improve the development experience.</li>
+  <li>Concepts can reduce the boilerplate necessary for defining
+  and using compile-time constraints, often increasing the clarity
+  of the resulting code.</li>
+  <li>Constraints provide some capabilities that are difficult to
+  achieve with templates and SFINAE techniques.</li>
+</ul>
+
+<p class="cons"></p>
+<ul>
+  <li>As with templates, concepts can make code significantly more
+  complex and difficult to understand.</li>
+  <li>Concept syntax can be confusing to readers, as concepts
+  appear similar to class types at their usage sites.</li>
+  <li>Concepts, especially at API boundaries, increase code
+  coupling, rigidity, and ossification.</li>
+  <li>Concepts and constraints can replicate logic from a function
+  body, resulting in code duplication and increased maintenance
+  costs.</li>
+  <li>Concepts muddy the source of truth for their underlying
+  contracts, as they are standalone named entities that can be
+  utilized in multiple locations, all of which evolve separately
+  from each other.
+  This can cause the stated and implied requirements to diverge
+  over time.</li>
+  <li>Concepts and constraints affect overload resolution in novel
+  and non-obvious ways.</li>
+  <li>As with SFINAE, constraints make it harder to refactor code
+  at scale.</li>
+</ul>
+
+<p class="decision"></p>
+<p>Predefined concepts in the standard library should be
+preferred to type traits, when equivalent ones exist.
+(e.g., if <code>std::is_integral_v</code> would have been used
+before C++20, then <code>std::integral</code> should be used in
+C++20 code.)
+Similarly, prefer modern constraint syntax
+(via <code>requires(<i>Condition</i>)</code>).
+Avoid legacy template metaprogramming constructs
+(such as <code>std::enable_if&lt;<i>Condition</i>&gt;</code>)
+as well as the <code>template&lt;<i>Concept</i> T&gt;</code>
+syntax.</p>
+
+<p>Do not manually re-implement any existing concepts or traits.
+For example, use
+<code>requires(std::default_initializable&lt;T&gt;)</code>
+instead of
+<code>requires(requires { T v; })</code>
+or the like.
+
+</p><p>New <code>concept</code> declarations should be rare, and only
+defined internally within a library, such that they are not
+exposed at API boundaries.
+More generally, do not use concepts or constraints in cases where
+you wouldn't use their legacy template equivalents in C++17.
+</p>
+
+<p>Do not define concepts that duplicate the function body,
+or impose requirements that would be insignificant or obvious
+from reading the body of the code or the resulting error messages.
+For example, avoid the following:
+</p><pre class="badcode">template &lt;typename T&gt;     // Bad - redundant with negligible benefit
+concept Addable = std::copyable&lt;T&gt; &amp;&amp; requires(T a, T b) { a + b; };
+template &lt;Addable T&gt;
+T Add(T x, T y, T z) { return x + y + z; }
+</pre>
+Instead, prefer to leave code as an ordinary template unless
+you can demonstrate that concepts result in significant
+improvement for that particular case, such as in the resulting
+error messages for a deeply nested or non-obvious
+requirement.
+
+<p>Concepts should be statically verifiable by the compiler.
+Do not use any concept whose primary benefits would come from a
+semantic (or otherwise unenforced) constraint.
+Requirements that are unenforced at compile time should instead
+be imposed via other mechanisms such as comments, assertions,
+or tests.</p>
+
 <h3 id="Boost">Boost</h3>
 
 <p>Use only approved libraries from the Boost library
@@ -3933,9 +4075,10 @@ guide, the following C++ features may not be used:</p>
 
 <p class="definition"></p>
 <p>There are several ways to create names that are aliases of other entities:</p>
-<pre>typedef Foo Bar;
-using Bar = Foo;
-using other_namespace::Foo;
+<pre>using Bar = Foo;
+typedef Foo Bar;  // But prefer `using` in C++ code.
+using ::other_namespace::Foo;
+using enum MyEnumType;  // Creates aliases for all enumerators in MyEnumType.
 </pre>
 
   <p>In new code, <code>using</code> is preferable to <code>typedef</code>,
@@ -4226,8 +4369,8 @@ enum class UrlTableError { ...
 <h3 id="Variable_Names">Variable Names</h3>
 
 <p>The names of variables (including function parameters) and data members are
-all lowercase, with underscores between words. Data members of classes (but not
-structs) additionally have trailing underscores. For instance:
+<code>snake_case</code> (all lowercase, with underscores between words). Data members of classes
+(but not structs) additionally have trailing underscores. For instance:
 <code>a_local_variable</code>, <code>a_struct_data_member</code>,
 <code>a_class_data_member_</code>.</p>
 
@@ -4235,7 +4378,7 @@ structs) additionally have trailing underscores. For instance:
 
 <p>For example:</p>
 
-<pre>std::string table_name;  // OK - lowercase with underscore.
+<pre>std::string table_name;  // OK - snake_case.
 </pre>
 
 <pre class="badcode">std::string tableName;   // Bad - mixed case.
@@ -4286,9 +4429,25 @@ const int kAndroid8_0_0 = 24;  // Android 8.0.0
 
 <p>All such variables with static storage duration (i.e., statics and globals,
 see <a href="http://en.cppreference.com/w/cpp/language/storage_duration#Storage_duration">
-Storage Duration</a> for details) should be named this way.  This
-convention is optional for variables of other storage classes, e.g., automatic
-variables, otherwise the usual variable naming rules apply.</p>
+Storage Duration</a> for details) should be named this way, including those in templates where
+different instantiations of the template may have different values.  This convention is optional for
+variables of other storage classes, e.g., automatic variables; otherwise the usual variable naming
+rules apply. For example:</p>
+
+<pre>void ComputeFoo(absl::string_view suffix) {
+  // Either of these is acceptable.
+  const absl::string_view kPrefix = "prefix";
+  const absl::string_view prefix = "prefix";
+  ...
+}
+</pre>
+
+<pre class="badcode">void ComputeFoo(absl::string_view suffix) {
+  // Bad - different invocations of ComputeFoo give kCombined different values.
+  const std::string kCombined = absl::StrCat(kPrefix, suffix);
+  ...
+}
+</pre>
 
 <h3 id="Function_Names">Function Names</h3>
 
@@ -4450,12 +4609,19 @@ comment and what style you use where.</p>
 <p>Start each file with license boilerplate.</p>
 </div>
 
-<p>File comments describe the contents of a file. If a file declares,
-implements, or tests exactly one abstraction that is documented by a comment
-at the point of declaration, file comments are not required. All other files
-must have file comments.</p>
+<p>If a source file (such as a <code>.h</code> file) declares multiple user-facing abstractions
+(common functions, related classes, etc.), include a comment describing the collection of those
+abstractions. Include enough detail for future authors to know what does not fit there. However,
+the detailed documentation about individual abstractions belongs with those abstractions, not at the
+file level.</p>
 
-<h4>Legal Notice and Author Line</h4>
+<p>For instance, if you write a file comment for <code>frobber.h</code>, you do not need
+to include a file comment in <code>frobber.cc</code> or
+<code>frobber_test.cc</code>. On the other hand, if you write a collection of classes in
+<code>registered_objects.cc</code> that has no associated header file, you must include a file
+comment in <code>registered_objects.cc</code>.
+
+</p><h4>Legal Notice and Author Line</h4>
 
 
 
@@ -4471,18 +4637,7 @@ author line, consider deleting the author line.
 New files should usually not contain copyright notice or
 author line.</p>
 
-<h4>File Contents</h4>
-
-<p>If a <code>.h</code> declares multiple abstractions, the file-level comment
-should broadly describe the contents of the file, and how the abstractions are
-related. A 1 or 2 sentence file-level comment may be sufficient. The detailed
-documentation about individual abstractions belongs with those abstractions,
-not at the file level.</p>
-
-<p>Do not duplicate comments in both the <code>.h</code> and the
-<code>.cc</code>. Duplicated comments diverge.</p>
-
-<h3 id="Class_Comments">Class Comments</h3>
+<h3 id="Class_Comments">Struct and Class Comments</h3>
 
 <p>Every non-obvious class or struct declaration should have an
 accompanying comment that describes what it is for and how it should
@@ -4498,6 +4653,8 @@ class GargantuanTableIterator {
   ...
 };
 </pre>
+
+<h4 id="Class_Comments_Details">Class Comments</h4>
 
 <p>The class comment should provide the reader with enough information to know
 how and when to use the class, as well as any additional considerations
@@ -4759,23 +4916,18 @@ a short-term solution, or good-enough but not perfect.</p>
 <p><code>TODO</code>s should include the string
 <code>TODO</code> in all caps, followed by the
 
-name, e-mail address, bug ID, or other
+bug ID, name, e-mail address, or other
 identifier
 of the person or issue with the best context
-about the problem referenced by the <code>TODO</code>. The
-main purpose is to have a consistent <code>TODO</code> that
-can be searched to find out how to get more details upon
-request. A <code>TODO</code> is not a commitment that the
-person referenced will fix the problem. Thus when you create
-a <code>TODO</code> with a name, it is almost always your
-name that is given.</p>
+about the problem referenced by the <code>TODO</code>.
 
-
+</p>
 
 <div>
-<pre>// TODO(kl@gmail.com): Use a "*" here for concatenation operator.
-// TODO(Zeke) change this to use relations.
-// TODO(bug 12345): remove the "Last visitors" feature.
+<pre>// TODO: bug 12345678 - Remove this after the 2047q4 compatibility window expires.
+// TODO: example.com/my-design-doc - Manually fix up this code the next time it's touched.
+// TODO(bug 12345678): Update this list after the Foo service is turned down.
+// TODO(John): Use a "\*" here for concatenation operator.
 </pre>
 </div>
 
@@ -4897,7 +5049,8 @@ if included in the source as straight UTF-8.</p>
 <p>When possible, avoid the <code>u8</code> prefix.
 It has significantly different semantics starting in C++20
 than in C++17, producing arrays of <code>char8_t</code>
-rather than <code>char</code>.
+rather than <code>char</code>, and will change again in C++23.
+
 
 </p><p>You shouldn't use <code>char16_t</code> and
 <code>char32_t</code> character types, since they're for
